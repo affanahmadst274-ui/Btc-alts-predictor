@@ -31,10 +31,22 @@ os.makedirs(MODELS_DIR, exist_ok=True)
 # --- Utility functions ---
 
 def fetch_prices(tickers, period="1y", interval="1d"):
-    # Use yfinance to download adjusted close
-    df = yf.download(tickers, period=period, interval=interval, progress=False, threads=False)["Adj Close"]
-    if isinstance(df, pd.Series):
-        df = df.to_frame()
+    data = yf.download(tickers, period=period, interval=interval, progress=False, threads=False)
+    # If yfinance returned a DataFrame with columns like ("Adj Close", "BTC-USD"), extract that level
+    if isinstance(data.columns, pd.MultiIndex):
+        if 'Adj Close' in data.columns.get_level_values(0):
+            df = data['Adj Close']
+        else:
+            # fallback to 'Close'
+            df = data['Close']
+    else:
+        # Single ticker case — yfinance returns Series or simple DF
+        if 'Adj Close' in data.columns:
+            df = data[['Adj Close']]
+        elif 'Close' in data.columns:
+            df = data[['Close']]
+        else:
+            raise KeyError("No 'Adj Close' or 'Close' in Yahoo Finance data")
     df = df.dropna(how="all")
     return df
 
