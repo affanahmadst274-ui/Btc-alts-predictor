@@ -1,11 +1,9 @@
-# streamlit_btc_alt_predictor.py
-# Streamlit app to predict altcoin price moves given a BTC target using historical correlations.
-# Features:
-# - Fetches historical prices with yfinance
-# - Trains per-alt incremental models (SGDRegressor) mapping BTC returns -> alt returns
-# - Lets you enter a BTC target price (absolute or %), shows predicted % move and predicted price for selected alts
-# - Stores history and allows "record actuals" to update training data (online learning via partial_fit)
-# - Saves models and history to disk (models/*.joblib, data/history.csv)
+# streamlit_btc_alt_predictor_v4_investment_ready.py
+# Upgraded predictor for portfolio allocation research
+# - Adds multi-feature models (rolling returns, volatility, alt/BTC ratio)
+# - Option to use RandomForestRegressor (non-linear) or SGD/Linear
+# - Accuracy trend chart (history of past prediction errors)
+# - Keeps self-learning from older predictions (>3 days)
 
 import streamlit as st
 import pandas as pd
@@ -13,283 +11,335 @@ import numpy as np
 import yfinance as yf
 import os
 import joblib
-from sklearn.linear_model import SGDRegressor
-from sklearn.linear_model import LinearRegression
+from sklearn.linear_model import SGDRegressor, LinearRegression
+from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import make_pipeline
 from datetime import datetime, timedelta
 
-# --- Constants / defaults ---
-DEFAULT_ALTS = ["ETH-USD", "SOL-USD", "BNB-USD"]
-BTC_TICKER = "BTC-USD"
+# ------------------------- Config -------------------------
+APP_NAME = "BTC → Alts Predictor v4 (Investment-ready)"
 DATA_DIR = "models_data"
-HISTORY_CSV = os.path.join(DATA_DIR, "history.csv")
 MODELS_DIR = os.path.join(DATA_DIR, "models")
-
+PRED_CSV = os.path.join(DATA_DIR, "predictions.csv")
+HISTORY_CSV = os.path.join(DATA_DIR, "history.csv")
+BTC = "BTC-USD"
+DEFAULT_ALTS = ["ETH-USD", "SOL-USD", "BNB-USD"]
+LEARN_DELAY = 3  # days
+LOOKBACK_DAYS = 365
 os.makedirs(MODELS_DIR, exist_ok=True)
+os.makedirs(DATA_DIR, exist_ok=True)
 
-# --- Utility functions ---
+# ------------------------- Utilities -------------------------
 
-def fetch_prices(tickers, period="1y", interval="1d"):
-    data = yf.download(tickers, period=period, interval=interval, progress=False, threads=False)
-    # If yfinance returned a DataFrame with columns like ("Adj Close", "BTC-USD"), extract that level
-    if isinstance(data.columns, pd.MultiIndex):
-        if 'Adj Close' in data.columns.get_level_values(0):
-            df = data['Adj Close']
+def safe_download(tickers, period="1y", interval="1d", start=None, end=None):
+    # handle single ticker vs list and multiindex
+    if isinstance(tickers, (list, tuple)) and len(tickers) == 1:
+        tickers = tickers[0]
+    df = yf.download(tickers, period=period, interval=interval, start=start, end=end, progress=False, threads=False)
+    if df is None or df.empty:
+        return pd.DataFrame()
+    if isinstance(df.columns, pd.MultiIndex):
+        # prefer Adj Close
+        if 'Adj Close' in df.columns.get_level_values(0):
+            out = df['Adj Close']
         else:
-            # fallback to 'Close'
-            df = data['Close']
+            out = df['Close']
     else:
-        # Single ticker case — yfinance returns Series or simple DF
-        if 'Adj Close' in data.columns:
-            df = data[['Adj Close']]
-        elif 'Close' in data.columns:
-            df = data[['Close']]
+        if 'Adj Close' in df.columns:
+            out = df[['Adj Close']]
+            # if single ticker, ensure column named
+            if isinstance(tickers, str):
+                out.columns = [tickers]
+        elif 'Close' in df.columns:
+            out = df[['Close']]
+            if isinstance(tickers, str):
+                out.columns = [tickers]
         else:
-            raise KeyError("No 'Adj Close' or 'Close' in Yahoo Finance data")
-    df = df.dropna(how="all")
-    return df
+            return pd.DataFrame()
+    if isinstance(out, pd.Series):
+        out = out.to_frame()
+    return out.dropna(how='all')
 
 
-def pct_return(series):
-    return series.pct_change().dropna()
+def ensure_pred_file():
+    if not os.path.exists(PRED_CSV):
+        cols = ['date','btc_pct','ticker','pred_return','pred_price','actual_return']
+        pd.DataFrame(columns=cols).to_csv(PRED_CSV, index=False)
 
 
-def ensure_history():
-    if not os.path.exists(HISTORY_CSV):
-        df = pd.DataFrame(columns=["date","ticker","btc_price","asset_price","btc_return","asset_return"])
-        df.to_csv(HISTORY_CSV, index=False)
+def load_predictions():
+    ensure_pred_file()
+    return pd.read_csv(PRED_CSV, parse_dates=['date'])
 
 
-def load_history():
-    ensure_history()
-    return pd.read_csv(HISTORY_CSV, parse_dates=["date"]) if os.path.exists(HISTORY_CSV) else pd.DataFrame()
+def save_prediction_rows(rows):
+    ensure_pred_file()
+    df_new = pd.DataFrame(rows)
+    if os.path.exists(PRED_CSV):
+        df_old = pd.read_csv(PRED_CSV)
+        df = pd.concat([df_old, df_new], ignore_index=True)
+    else:
+        df = df_new
+    df.to_csv(PRED_CSV, index=False)
 
 
-def append_history(new_rows: pd.DataFrame):
-    ensure_history()
-    new_rows.to_csv(HISTORY_CSV, mode='a', header=not os.path.exists(HISTORY_CSV), index=False)
-
-
-def model_path(ticker):
+def model_file(ticker, model_name):
     safe = ticker.replace('/', '_')
-    return os.path.join(MODELS_DIR, f"model_{safe}.joblib")
+    return os.path.join(MODELS_DIR, f"{safe}_{model_name}.joblib")
 
 
-def load_or_create_model(ticker, model_type="sgd"):
-    p = model_path(ticker)
+def load_model(ticker, model_name):
+    p = model_file(ticker, model_name)
     if os.path.exists(p):
         try:
             return joblib.load(p)
         except Exception:
-            pass
-    # create new incremental model pipeline: scaler + SGDRegressor
-    if model_type == "sgd":
-        model = make_pipeline(StandardScaler(), SGDRegressor(max_iter=1000, tol=1e-3))
-    else:
-        # fallback to simple LinearRegression (not incremental)
-        model = make_pipeline(StandardScaler(), LinearRegression())
-    return model
+            return None
+    return None
 
 
-def save_model(ticker, model):
-    joblib.dump(model, model_path(ticker))
+def save_model(m, ticker, model_name):
+    joblib.dump(m, model_file(ticker, model_name))
 
-# --- Streamlit UI ---
+# ------------------------- Feature engineering -------------------------
 
-st.set_page_config(page_title="BTC -> Alts Predictor", layout="wide")
-st.title("BTC → Altcoins Quick Predictor")
-st.write("Enter a BTC target or % change and see predicted % and prices for selected altcoins based on historical correlation.")
+def build_features(btc_series, asset_series, window=7):
+    # both are pandas Series indexed by date
+    df = pd.concat([btc_series, asset_series], axis=1, join='inner')
+    df.columns = ['btc','asset']
+    # returns
+    df['btc_ret_1d'] = df['btc'].pct_change()
+    df['asset_ret_1d'] = df['asset'].pct_change()
+    df['btc_ret_7d'] = df['btc'].pct_change(periods=window)
+    df['asset_ret_7d'] = df['asset'].pct_change(periods=window)
+    # volatility (rolling std of daily returns)
+    df['btc_vol_7d'] = df['btc_ret_1d'].rolling(window).std()
+    # ratio (asset price relative to btc)
+    df['asset_btc_ratio'] = df['asset'] / df['btc']
+    # momentum: difference between 7d and 1d
+    df['btc_mom'] = df['btc_ret_7d'] - df['btc_ret_1d']
+    # drop na
+    df = df.dropna()
+    return df
 
-# Sidebar settings
+# ------------------------- App UI -------------------------
+
+st.set_page_config(page_title=APP_NAME, layout='wide')
+st.title(APP_NAME)
+st.caption('Use this as research tooling — not financial advice.')
+
+# Accuracy metric and trend
+preds_df = load_predictions()
+if {'pred_return','actual_return'}.issubset(preds_df.columns) and not preds_df[['pred_return','actual_return']].dropna().empty:
+    preds_df['error_abs'] = (preds_df['actual_return'] - preds_df['pred_return']).abs()
+    mean_err = preds_df['error_abs'].mean()
+    accuracy = max(0.0, 100.0 - mean_err*100.0)
+    color = '🟢' if accuracy>=70 else ('🟡' if accuracy>=40 else '🔴')
+    st.metric('Model Accuracy', f"{color} {accuracy:.2f}%")
+    # trend chart: rolling accuracy (7-day)
+    preds_df = preds_df.sort_values('date')
+    rolling_err = preds_df['error_abs'].rolling(window=7, min_periods=1).mean()
+    rolling_acc = 100 - rolling_err*100
+    st.line_chart(pd.DataFrame({'accuracy': rolling_acc.values}, index=preds_df['date']))
+else:
+    st.metric('Model Accuracy', 'N/A', 'insufficient data')
+
+# Sidebar controls
 with st.sidebar:
-    st.header("Settings")
-    alts_input = st.text_area("Alt tickers (comma separated)", value=", ".join(DEFAULT_ALTS))
-    alts = [t.strip().upper() for t in alts_input.split(",") if t.strip()]
-    period = st.selectbox("Historical lookback", options=["6mo","1y","2y","5y"], index=1)
-    model_type = st.selectbox("Model type", options=["sgd","linear"], index=0)
-    retrain_days = st.number_input("Retrain using last N days of data", min_value=30, max_value=3650, value=365)
-    st.markdown("---")
-    st.markdown("**Data & model controls**")
-    if st.button("Refresh historical data & retrain all"):
-        st.session_state.get("retrain_all", False)
-        st.session_state["retrain_all"] = True
+    st.header('Controls')
+    alts_input = st.text_area('Alt tickers (comma separated)', value=', '.join(DEFAULT_ALTS))
+    alts = [t.strip().upper() for t in alts_input.split(',') if t.strip()]
+    lookback = st.selectbox('Historical lookback', options=['6mo','1y','2y'], index=1)
+    model_choice = st.selectbox('Model', options=['sgd','linear','rf'], index=2)
+    retrain_days = st.number_input('Retrain recent N days', min_value=30, max_value=3650, value=365)
+    window_days = st.slider('Feature window days (for 7d features)', min_value=3, max_value=30, value=7)
+    st.markdown('---')
+    st.write('Data dir:'); st.write(DATA_DIR)
 
-# Main: fetch current BTC price to compute target by %
-with st.spinner("Fetching latest BTC price..."):
-    recent = yf.download([BTC_TICKER], period="7d", interval="1d", progress=False, threads=False)["Adj Close"].dropna()
-    if recent.empty:
-        st.error("Could not fetch current BTC price. Check network or ticker.")
+# fetch BTC current
+with st.spinner('Fetching BTC...'):
+    btc_df = safe_download(BTC, period='7d')
+    if btc_df.empty:
+        st.error('Could not fetch BTC price')
         st.stop()
-    current_btc = float(recent.iloc[-1].values[0])
+    btc_price = float(btc_df.iloc[-1,0])
 
+st.write(f'BTC current: ${btc_price:,.2f}')
+
+# user target
 col1, col2 = st.columns([2,1])
 with col1:
-    st.subheader("Enter BTC target")
-    btc_target_mode = st.radio("Target input type", ["Absolute price","Percentage change from current BTC"], index=0)
-    if btc_target_mode == "Absolute price":
-        btc_target = st.number_input("BTC target price (USD)", value=round(current_btc*1.05,2))
-        btc_pct = (btc_target - current_btc) / current_btc
+    mode = st.radio('Target input type', ['Absolute price','% change'], index=0)
+    if mode=='Absolute price':
+        btc_target = st.number_input('BTC target price', value=round(btc_price*1.05,2))
+        btc_pct = (btc_target - btc_price)/btc_price
     else:
-        btc_pct_input = st.number_input("BTC % change (e.g. 10 for +10%, -5 for -5%)", value=5.0)
-        btc_pct = float(btc_pct_input)/100.0
-        btc_target = current_btc * (1 + btc_pct)
-    st.write(f"Current BTC: ${current_btc:,.2f} → Target ${btc_target:,.2f} ({btc_pct*100:+.2f}%)")
+        btc_pct = st.number_input('BTC % (e.g. 5 for 5%)', value=5.0)/100.0
+        btc_target = btc_price*(1+btc_pct)
+    st.write(f'Target ${btc_target:,.2f} ({btc_pct*100:+.2f}%)')
 
 with col2:
-    st.subheader("Quick actions")
-    if st.button("Predict now"):
-        st.session_state["do_predict"] = True
-    st.markdown("---")
-    st.write("Model notes:")
-    st.write("- Models learn from historical BTC vs alt returns.")
-    st.write("- You can record actual outcomes later to let the models learn from mistakes (online update).")
+    predict = st.button('Predict')
+    
+# =============================================================
+# Step: Historical Bootstrapping for Initial Learning
+# =============================================================
+st.sidebar.info("📈 Bootstrapping models with past BTC/Altcoin data...")
 
-# Predict block
-if st.session_state.get("do_predict", False) or st.session_state.get("retrain_all", False):
-    with st.spinner("Fetching historical data and training models..."):
-        tickers = [BTC_TICKER] + alts
-        prices = fetch_prices(tickers, period=period)
-        if BTC_TICKER not in prices.columns:
-            st.error("BTC price missing from fetched data. Try a different lookback or check network.")
-            st.stop()
+try:
+    hist_days = 90  # adjust this for how much history you want
+    end_date = datetime.utcnow()
+    start_date = end_date - timedelta(days=hist_days)
 
-        btc_prices = prices[BTC_TICKER].dropna()
-        btc_returns = pct_return(btc_prices)
+    btc_hist = yf.download(BTC, start=start_date, end=end_date, progress=False)
+    if "Adj Close" not in btc_hist.columns and "Close" in btc_hist.columns:
+        btc_hist["Adj Close"] = btc_hist["Close"]
+    btc_hist["btc_ret"] = btc_hist["Adj Close"].pct_change() * 100
 
-        results = []
-        models = {}
-        for alt in alts:
-            if alt not in prices.columns:
-                st.warning(f"Ticker {alt} not found in yfinance data; skipping")
-                continue
-            alt_prices = prices[alt].dropna()
-            # align dates
-            df = pd.concat([btc_prices, alt_prices], axis=1, join='inner').dropna()
-            df.columns = ["btc","asset"]
-            df_ret = df.pct_change().dropna()
-            # use last N days if requested
-            if retrain_days and retrain_days < len(df_ret):
-                df_ret = df_ret.tail(retrain_days)
+    for alt in alts:
+        alt_hist = yf.download(alt, start=start_date, end=end_date, progress=False)
+        if "Adj Close" not in alt_hist.columns and "Close" in alt_hist.columns:
+            alt_hist["Adj Close"] = alt_hist["Close"]
+        alt_hist["alt_ret"] = alt_hist["Adj Close"].pct_change() * 100
 
-            X = df_ret[["btc"]].values
-            y = df_ret["asset"].values
+        merged = pd.merge(
+            btc_hist[["btc_ret"]],
+            alt_hist[["alt_ret"]],
+            left_index=True,
+            right_index=True,
+        ).dropna()
 
-            model = load_or_create_model(alt, model_type=model_type)
-            try:
-                # For SGDRegressor pipeline, we can call fit (cold start). If it's LinearRegression, fit.
-                model.fit(X, y)
-            except Exception as e:
-                st.warning(f"Could not fit model for {alt}: {e}")
-                continue
-            save_model(alt, model)
-            models[alt] = model
+        if not merged.empty:
+            X = merged[["btc_ret"]].values
+            y = merged["alt_ret"].values
 
-            # Predict alt return corresponding to btc_pct
-            X_pred = np.array([[btc_pct]])
-            pred_ret = float(model.predict(X_pred)[0])
-            current_price = float(alt_prices.iloc[-1])
-            pred_price = current_price * (1 + pred_ret)
-            results.append({"ticker": alt, "current": current_price, "predicted_price": pred_price, "predicted_return": pred_ret})
+            model_name = model_choice
+            model = load_model(alt, model_name)
+            if model is None:
+                if model_choice == "sgd":
+                    model = make_pipeline(StandardScaler(), SGDRegressor(max_iter=1000, tol=1e-3))
+                elif model_choice == "linear":
+                    model = make_pipeline(StandardScaler(), LinearRegression())
+                else:
+                    model = RandomForestRegressor(n_estimators=200, max_depth=6, random_state=42)
 
-        # show results
-        if results:
-            res_df = pd.DataFrame(results)
-            res_df["current"] = res_df["current"].map(lambda x: f"${x:,.4f}")
-            res_df["predicted_price"] = res_df["predicted_price"].map(lambda x: f"${x:,.4f}")
-            res_df["predicted_return_pct"] = (res_df["predicted_return"]*100).map(lambda x: f"{x:+.2f}%")
-            st.subheader("Predictions")
-            st.table(res_df[["ticker","current","predicted_price","predicted_return_pct"]])
-
-            st.markdown("---")
-            st.write("You can record actual outcomes (future) below to update the models with real observed errors — this enables the model to learn from mistakes incrementally.")
-
-            # Save a snapshot to history for record (optional)
-            snapshot = []
-            today = datetime.utcnow().date().isoformat()
-            for r in results:
-                snapshot.append({"date": today, "ticker": r["ticker"], "btc_price": current_btc, "asset_price": float(r["current"].replace('$','').replace(',','')), "btc_return": btc_pct, "asset_return": r["predicted_return"]})
-            # append to history as 'prediction' records (we keep predictions too)
-            snapshot_df = pd.DataFrame(snapshot)
-            # Tagging predictions optional — keep same columns
-            append_history(snapshot_df)
-
-            # Show option to record actuals now
-            st.subheader("Record actual outcomes (when known)")
-            with st.form("record_actuals"):
-                st.write("Enter actual BTC price at target time and actual prices for alts (or leave blank to skip). The app will compute the actual returns and update models.")
-                actual_btc = st.number_input("Actual BTC price at time of outcome (USD)", value=float(btc_target))
-                actuals = {}
-                for alt in alts:
-                    actuals[alt] = st.text_input(f"Actual price for {alt} (leave blank if unknown)", value="")
-                submitted = st.form_submit_button("Record & Update Models")
-                if submitted:
-                    # collect rows and retrain with partial_fit (if using SGD)
-                    rows = []
-                    for alt, val in actuals.items():
-                        if val.strip() == "":
-                            continue
-                        try:
-                            valf = float(val)
-                        except:
-                            st.warning(f"Invalid price for {alt}: {val}")
-                            continue
-                        btc_ret_actual = (actual_btc - current_btc) / current_btc
-                        asset_ret_actual = (valf - float(prices[alt].iloc[-1])) / float(prices[alt].iloc[-1])
-                        rows.append({"date": datetime.utcnow().isoformat(), "ticker": alt, "btc_price": actual_btc, "asset_price": valf, "btc_return": btc_ret_actual, "asset_return": asset_ret_actual})
-
-                    if rows:
-                        rows_df = pd.DataFrame(rows)
-                        append_history(rows_df)
-                        # Try partial_fit if model is SGD
-                        for row in rows:
-                            alt = row["ticker"]
-                            model = load_or_create_model(alt, model_type=model_type)
-                            X_new = np.array([[row["btc_return"]]])
-                            y_new = np.array([row["asset_return"]])
-                            try:
-                                # only SGDRegressor pipeline supports partial_fit on the final estimator
-                                if hasattr(model.named_steps[list(model.named_steps.keys())[-1]], "partial_fit"):
-                                    # extract scaler and regressor
-                                    scaler = model.named_steps[list(model.named_steps.keys())[0]]
-                                    reg = model.named_steps[list(model.named_steps.keys())[-1]]
-                                    Xs = scaler.transform(X_new)
-                                    reg.partial_fit(Xs, y_new)
-                                    save_model(alt, model)
-                                else:
-                                    # full retrain from history
-                                    st.info(f"Model for {alt} does not support partial_fit — retraining from history instead.")
-                                    # retrain from entire saved history
-                                    hist = load_history()
-                                    h = hist[hist.ticker==alt]
-                                    if len(h) > 5:
-                                        X = h[["btc_return"]].values
-                                        y = h["asset_return"].values
-                                        model.fit(X,y)
-                                        save_model(alt, model)
-                            except Exception as e:
-                                st.warning(f"Could not update model for {alt}: {e}")
-                        st.success("Recorded actuals and updated models (if supported).")
-                    else:
-                        st.info("No actuals provided.")
-
+            model.fit(X, y)
+            save_model(model, alt, model_name)
+            st.sidebar.success(f"{alt} trained on {len(merged)} days of real data.")
         else:
-            st.info("No predictions were produced (no valid alt tickers).")
+            st.sidebar.warning(f"No overlapping data found for {alt}.")
+except Exception as e:
+    st.sidebar.error(f"Bootstrapping error: {e}")
 
-# Provide guidance and warnings
-st.markdown("---")
-st.header("Important notes & limitations")
-st.write("This tool is a *simple* correlation-based predictor. A few important cautions:")
-st.write("- Historical correlation is not a guarantee of future behavior. Crypto markets are volatile and relationships change quickly.")
-st.write("- The model above uses BTC -> alt return regressions; it ignores many important drivers (liquidity, news, sentiment, macro, etc.).")
-st.write("- You should NOT rely on this for high-leverage or large financial decisions. Consider this a research/assistant tool, not trading advice.")
-st.write("- 100% accuracy is impossible to guarantee; models can improve but will never be perfect. Use risk management and do your own due diligence.")
+# ------------------------- Predict & Train -------------------------
+if predict:
+    rows_to_log = []
+    results = []
+    for alt in alts:
+        # fetch history
+        hist = safe_download([BTC, alt], period='1y')
+        if hist.empty or BTC not in hist.columns or alt not in hist.columns:
+            st.warning(f'No data for {alt}'); continue
+        btc_s = hist[BTC]
+        alt_s = hist[alt]
+        feat = build_features(btc_s, alt_s, window=window_days)
+        if feat.empty:
+            st.warning(f'Not enough history for {alt}'); continue
+        # features X and target y (we use 7d asset return as target)
+        X = feat[['btc_ret_1d','btc_ret_7d','btc_vol_7d','asset_btc_ratio','btc_mom']].values
+        y = feat['asset_ret_7d'].values
+        # select model
+        model_name = model_choice
+        model = load_model(alt, model_name)
+        if model is None:
+            if model_choice=='sgd':
+                model = make_pipeline(StandardScaler(), SGDRegressor(max_iter=1000, tol=1e-3))
+            elif model_choice=='linear':
+                model = make_pipeline(StandardScaler(), LinearRegression())
+            else:
+                model = RandomForestRegressor(n_estimators=200, max_depth=6, random_state=42)
+        # fit
+        try:
+            model.fit(X,y)
+            save_model(model, alt, model_name)
+        except Exception as e:
+            st.warning(f'Could not fit model for {alt}: {e}')
+            continue
+        # prepare current feature vector based on latest prices
+        latest = feat.iloc[-1:]
+        X_now = latest[['btc_ret_1d','btc_ret_7d','btc_vol_7d','asset_btc_ratio','btc_mom']].values
+        # predict 7d return (decimal)
+        try:
+            pred_ret = float(model.predict(X_now)[0])
+        except Exception:
+            pred_ret = 0.0
+        # predicted price after 7 days
+        cur_price = float(alt_s.iloc[-1])
+        pred_price = cur_price * (1 + pred_ret)
+        results.append((alt, pred_ret*100, cur_price, pred_price))
+        rows_to_log.append({'date': datetime.utcnow().strftime('%Y-%m-%d'), 'btc_pct': btc_pct, 'ticker': alt, 'pred_return': pred_ret, 'pred_price': pred_price, 'actual_return': np.nan})
+    # display
+    if results:
+        st.subheader('Predictions (7-day horizon):')
+        for alt, pct, cur, p in results:
+            st.write(f"**{alt}** → Predicted 7d move: {pct:+.2f}% | Current: ${cur:,.2f} | Target: ${p:,.2f}")
+        save_prediction_rows(rows_to_log)
+        st.success('Predictions saved and models updated.')
+    else:
+        st.info('No predictions produced.')
 
-st.markdown("---")
-st.write("If you'd like, I can:")
-st.write("1. Expand the model to use lagged returns, volatility, and multiple features (ETH returns, market cap) — typically improves performance.")
-st.write("2. Add cross-validation and simple performance metrics (MAE, RMSE) and show backtests on historical BTC moves.")
-st.write("3. Package this as a Docker image or a one-click Streamlit share app.")
+# ------------------------- Self-learning on startup -------------------------
+# Find predictions older than LEARN_DELAY days and fill actuals, then do incremental updates
+preds = load_predictions()
+if not preds.empty and 'actual_return' in preds.columns:
+    # Handle mixed date formats safely (ISO or plain date)
+    preds['date'] = pd.to_datetime(preds['date'], format='mixed', errors='coerce')
 
-st.write("Tell me which of the above you'd like next, or if you want the app modified to your exact tickers/timeframes.")
+    cutoff = pd.Timestamp(datetime.utcnow() - timedelta(days=LEARN_DELAY))
+    to_learn = preds[(preds['actual_return'].isna()) & (preds['date'] <= cutoff)]
 
+    if not to_learn.empty:
+        summary = {}
+        for idx, row in to_learn.iterrows():
+            alt = row['ticker'] if 'ticker' in row else row.get('alt')
+            check_date = (pd.to_datetime(row['date']) + timedelta(days=LEARN_DELAY)).date()
+            price, time = safe_download(
+                alt,
+                period='7d',
+                start=check_date.strftime('%Y-%m-%d'),
+                end=(check_date + timedelta(days=1)).strftime('%Y-%m-%d')
+            )
+
+            # safe_download returns df; adapt
+            actual_price = None
+            if isinstance(price, pd.DataFrame) and not price.empty:
+                actual_price = float(price.iloc[-1, 0])
+            if actual_price is None:
+                continue
+
+            base_price = row['pred_price'] / (1 + row['pred_return']) if row['pred_return'] != 0 else row['pred_price']
+            actual_ret = (actual_price - base_price) / base_price
+            preds.loc[idx, 'actual_return'] = actual_ret
+
+            # incremental update: load model and partial_fit if supported
+            model = load_model(alt, model_choice)
+            if model is not None:
+                try:
+                    # extract scaler + regressor if pipeline
+                    if hasattr(model, 'named_steps'):
+                        scaler = model.named_steps[list(model.named_steps.keys())[0]]
+                        reg = model.named_steps[list(model.named_steps.keys())[-1]]
+                        X_new = np.array([[row['btc_pct']]])
+                        Xs = scaler.transform(X_new)
+                        if hasattr(reg, 'partial_fit'):
+                            reg.partial_fit(Xs, np.array([actual_ret]))
+                            save_model(model, alt, model_choice)
+                except Exception:
+                    pass
+
+        preds.to_csv(PRED_CSV, index=False)
+
+# ------------------------- Footer -------------------------
+st.markdown('---')
+st.write('This tool is for research and portfolio planning. Do not use without risk management.')
